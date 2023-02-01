@@ -1,6 +1,7 @@
 from mumin import MuminDataset
 import numpy as np
 import pandas as pd
+import re
 
 with open("bearer_token.txt", "r") as f:
     bearer_token = f.read()
@@ -15,9 +16,11 @@ discusses_df = dataset.rels[('tweet', 'discusses', 'claim')]
 tweet_claim_df = (tweet_en_df.merge(discusses_df, left_index=True, right_on='src')
                           .merge(claim_df, left_on='tgt', right_index=True)
                           .reset_index(drop=True))
-
 tweet_claim_misinfo = tweet_claim_df[tweet_claim_df["label"] == "misinformation"]
 tweet_claim_factural = tweet_claim_df[tweet_claim_df["label"] == "factual"]
 tweet_claim_sampled_misinfo = tweet_claim_misinfo.sample(n=tweet_claim_factural.shape[0])
 tweet_claim_balanced = pd.concat([tweet_claim_factural, tweet_claim_sampled_misinfo])
-tweet_dataset_df = tweet_claim_balanced[["text", "label"]]
+tweet_dataset_df = tweet_claim_balanced[["text", "label"]].replace(r'\n',' ', regex=True)
+tweet_dataset_df["text"] = tweet_dataset_df["text"].apply(lambda x: re.split('https:\/\/.*', str(x))[0])
+tweet_dataset_df_nodup = tweet_dataset_df.drop_duplicates(subset=['text'])
+tweet_dataset_df_nodup.to_csv("mumin-large-equal.csv")
