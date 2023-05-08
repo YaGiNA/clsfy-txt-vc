@@ -9,7 +9,33 @@ from sklearn.preprocessing import normalize
 from xgboost import XGBClassifier
 from statistics import mean
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
+from torch.optim import Adam
+
+from tqdm import tqdm
 from read_dataset import read_dataset
+
+
+class TweetEmbeddingClassifyModel(nn.Module):
+    def __init__(self, in_channels, drop_rate) :
+        super(TweetEmbeddingClassifyModel, self).__init__()
+
+        self.drp1 = nn.Dropout(p=drop_rate)
+        self.line = nn.Linear(in_channels, 2)
+        self.drp2 = nn.Dropout(p=drop_rate)
+        self.smax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        x = self.drp1(x)
+        x = self.line(x)
+        x = self.drp2(x)
+        x = self.smax(x)
+        return x
 
 
 with open("bearer_token.txt", "r") as f:
@@ -63,6 +89,102 @@ def pred_xgb(Xs, ys):
     return (train_preds, val_preds, test_preds)
     
 
+def pred_emb_dense(Xs, ys):
+    BATCH_SIZE = 64 # 適宜変更
+    EPOCHS = 100 # 適宜変更
+    X_train, X_val, X_test = Xs
+    y_train, y_val, y_test = ys
+    train_set = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
+    val_set = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val))
+    test_set = TensorDataset(torch.from_numpy(X_test), torch.from_numpy(y_test))
+
+    train_dataloader = DataLoader(
+        train_set, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True,
+        num_workers=2, 
+        drop_last=True,
+        pin_memory=True
+    )
+    val_dataloader = DataLoader(
+        val_set, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True,
+        num_workers=2, 
+        drop_last=True,
+        pin_memory=True
+    )
+    test_dataloader = DataLoader(
+        test_set, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True,
+        num_workers=2, 
+        drop_last=False,
+        pin_memory=True
+    )
+
+
+    model = TweetEmbeddingClassifyModel(in_channels=X_train.shape[1], drop_rate=0.2)
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(DEVICE)
+    optimizer = Adam(model.parameters())
+    criterion = nn.CrossEntropyLoss()
+    for epoch in tqdm(range(EPOCHS)):
+        # 学習
+        model.train()
+        train_loss = 0
+        for batch, label in train_dataloader:
+
+            for param in model.parameters():
+                param.grad = None
+
+            batch = batch.float()
+
+            batch = batch.to(DEVICE)
+            label = label.to(DEVICE)
+
+            preds = model(batch)
+            loss = criterion(preds, label)
+            loss.backward()
+            optimizer.step()
+            
+        # Validation
+        model.eval()
+        valid_loss = 0
+        with torch.inference_mode():
+
+            for batch, label in val_dataloader:
+
+                batch = batch.float()
+
+                batch = batch.to(DEVICE)
+                label = label.to(DEVICE)
+
+                preds = model(batch)
+
+                loss = criterion(preds, label)
+                valid_loss += loss.item()
+
+        valid_loss /= len(val_dataloader)
+        if not epoch % 10:
+            print(epoch, "Loss:", valid_loss)
+
+    model.eval()
+    preds_list = []
+
+    with torch.no_grad():
+        for news in tqdm(test_dataloader):
+
+            for param in model.parameters():
+                param.grad = None
+
+            news = news[0]
+            news = news.to(DEVICE)
+
+            preds = model(news)[:, 1]
+            preds_list = preds_list + preds.tolist()
+    
+    return preds_list
 
 def calc_EER(y_target, normalized_vals):
     fpr, tpr, thresholds = roc_curve(y_target, normalized_vals, pos_label=1)
@@ -73,9 +195,14 @@ def calc_EER(y_target, normalized_vals):
 
 
 if __name__ == '__main__':
+    # TODO Add other classifier
     got_Xs, got_ys, test_indexes = set_dataset()
+    emb_dense_preds = pred_emb_dense(got_Xs, got_ys)
+    """
     xgb_preds = pred_xgb(got_Xs, got_ys)
     xgb_test_preds = xgb_preds[2]
+    """
+
     rawnet2_preds = {}
     with open("./pre_trained_eval_CM_scores-mumin.txt") as f:
         for line in f:
@@ -88,7 +215,8 @@ if __name__ == '__main__':
         except KeyError:
             print(test_idx, "not in rawnet2 results")
     normalized_rawnet2_test_preds = np.array([(x-min(rawnet2_test_vals))/(max(rawnet2_test_vals)-min(rawnet2_test_vals)) for x in rawnet2_test_vals])
-    combined_vals = np.array([(rawnet2 + xgb) / 2 for rawnet2, xgb in zip(normalized_rawnet2_test_preds, xgb_test_preds)])
+    combined_vals = np.array([(rawnet2 + emb) / 2 for rawnet2, emb in zip(normalized_rawnet2_test_preds, emb_dense_preds)])
+    # combined_vals = np.array([(rawnet2 + xgb) / 2 for rawnet2, xgb in zip(normalized_rawnet2_test_preds, xgb_test_preds)])
     test_scores = calc_EER(got_ys[2], combined_vals)
     print('*** Test scores ***')
     print(f'EER: {100 * test_scores:.2f}%')
