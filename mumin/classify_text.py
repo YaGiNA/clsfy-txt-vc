@@ -24,17 +24,24 @@ from read_dataset import read_dataset
 class TweetEmbeddingClassifyModel(nn.Module):
     def __init__(self, in_channels, drop_rate) :
         super(TweetEmbeddingClassifyModel, self).__init__()
-
+        hidden = 128
         self.drp1 = nn.Dropout(p=drop_rate)
-        self.line = nn.Linear(in_channels, 2)
+        # self.line = nn.Linear(in_channels, 1)
+        self.lin1 = nn.Linear(in_channels, hidden)
+        self.rel1 = nn.ReLU()
+        self.bnor = nn.BatchNorm1d(hidden)
         self.drp2 = nn.Dropout(p=drop_rate)
-        self.smax = nn.Softmax(dim=1)
+        self.lin2 = nn.Linear(hidden, 1)
+        self.sigm = nn.Sigmoid()
+        # self.smax = nn.Softmax(dim=1)
 
     def forward(self, x):
         x = self.drp1(x)
-        x = self.line(x)
+        x = self.rel1(self.lin1(x))
+        x = self.bnor(x)
         x = self.drp2(x)
-        x = self.smax(x)
+        x = self.sigm(self.lin2(x))
+        # x = self.smax(x)
         return x
 
 
@@ -89,14 +96,20 @@ def pred_xgb(Xs, ys):
     return (train_preds, val_preds, test_preds)
     
 
+def accuracy_fn(y_true, y_pred):
+    correct = torch.eq(y_true, y_pred).sum().item() # torch.eq() calculates where two tensors are equal
+    acc = (correct / len(y_pred)) * 100 
+    return acc
+
+
 def pred_emb_dense(Xs, ys):
-    BATCH_SIZE = 64 # 適宜変更
-    EPOCHS = 100 # 適宜変更
+    BATCH_SIZE = 32 # 適宜変更
+    EPOCHS = 1000 # 適宜変更
     X_train, X_val, X_test = Xs
     y_train, y_val, y_test = ys
-    train_set = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
-    val_set = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val))
-    test_set = TensorDataset(torch.from_numpy(X_test), torch.from_numpy(y_test))
+    train_set = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train).float())
+    val_set = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val).float())
+    test_set = TensorDataset(torch.from_numpy(X_test), torch.from_numpy(y_test).float())
 
     train_dataloader = DataLoader(
         train_set, 
@@ -127,8 +140,10 @@ def pred_emb_dense(Xs, ys):
     model = TweetEmbeddingClassifyModel(in_channels=X_train.shape[1], drop_rate=0.2)
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(DEVICE)
-    optimizer = Adam(model.parameters())
-    criterion = nn.CrossEntropyLoss()
+    # optimizer = Adam(model.parameters())
+    lrn_rate = 1e-4
+    optimizer = torch.optim.SGD(model.parameters(), lr=lrn_rate)
+    criterion = nn.BCELoss()
     for epoch in tqdm(range(EPOCHS)):
         # 学習
         model.train()
@@ -143,14 +158,18 @@ def pred_emb_dense(Xs, ys):
             batch = batch.to(DEVICE)
             label = label.to(DEVICE)
 
-            preds = model(batch)
-            loss = criterion(preds, label)
+            logits = model(batch).squeeze()
+            preds = torch.round(logits)
+
+            loss = criterion(logits, label)
             loss.backward()
             optimizer.step()
-            
+            train_loss += loss.item()
+        train_loss /= len(train_dataloader)
         # Validation
         model.eval()
         valid_loss = 0
+        valid_acc = []
         with torch.inference_mode():
 
             for batch, label in val_dataloader:
@@ -160,14 +179,17 @@ def pred_emb_dense(Xs, ys):
                 batch = batch.to(DEVICE)
                 label = label.to(DEVICE)
 
-                preds = model(batch)
+                logits = model(batch).squeeze()
+                preds = torch.round(logits)
 
-                loss = criterion(preds, label)
+                loss = criterion(logits, label)
                 valid_loss += loss.item()
+                valid_acc = valid_acc + [accuracy_fn(y_true=label, y_pred=preds)]
 
         valid_loss /= len(val_dataloader)
+        valid_acc = sum(valid_acc) / len(valid_acc)
         if not epoch % 10:
-            print(epoch, "Loss:", valid_loss)
+            print(epoch, "Loss:", valid_loss, "Accuracy:", valid_acc)
 
     model.eval()
     preds_list = []
@@ -180,9 +202,9 @@ def pred_emb_dense(Xs, ys):
 
             news = news[0]
             news = news.to(DEVICE)
+            test_pred = model(news).squeeze()
+            preds_list = preds_list + test_pred.tolist()
 
-            preds = model(news)[:, 1]
-            preds_list = preds_list + preds.tolist()
     
     return preds_list
 
@@ -191,7 +213,7 @@ def calc_EER(y_target, normalized_vals):
     fnr = 1 - tpr
     eer_threshold = thresholds[np.nanargmin(np.absolute((fnr - fpr)))]
     EER = fpr[np.nanargmin(np.absolute((fnr - fpr)))]
-    return EER#, eer_threshold
+    return EER, eer_threshold
 
 
 if __name__ == '__main__':
@@ -202,7 +224,7 @@ if __name__ == '__main__':
     xgb_preds = pred_xgb(got_Xs, got_ys)
     xgb_test_preds = xgb_preds[2]
     """
-
+    """
     rawnet2_preds = {}
     with open("./pre_trained_eval_CM_scores-mumin.txt") as f:
         for line in f:
@@ -217,11 +239,20 @@ if __name__ == '__main__':
     normalized_rawnet2_test_preds = np.array([(x-min(rawnet2_test_vals))/(max(rawnet2_test_vals)-min(rawnet2_test_vals)) for x in rawnet2_test_vals])
     combined_vals = np.array([(rawnet2 + emb) / 2 for rawnet2, emb in zip(normalized_rawnet2_test_preds, emb_dense_preds)])
     # combined_vals = np.array([(rawnet2 + xgb) / 2 for rawnet2, xgb in zip(normalized_rawnet2_test_preds, xgb_test_preds)])
-    test_scores = calc_EER(got_ys[2], combined_vals)
+    test_scores, threshold_EER = calc_EER(got_ys[2], combined_vals)
+
     print('*** Test scores ***')
     print(f'EER: {100 * test_scores:.2f}%')
     # print(f'EER: {100 * xgb_scores[2]:.2f}%')
-"""
+    """
+    print(got_ys[2][:10])
+    print(emb_dense_preds[:10])
+    test_scores, threshold_EER = calc_EER(got_ys[2], emb_dense_preds)
+    print(f'EER: {100 * test_scores:.2f}%')
+    """
+    val_fake = [val for val, y in zip(combined_vals, got_ys[2]) if y > 0]
+    print(val_fake[:10])
+    print(len([val for val in val_fake if val > threshold_EER])/len(val_fake))
     print('*** Training scores ***')
     print(f'Misinformation F1: {100 * xgb_scores[0][1]:.2f}%')
     print(f'Factual F1: {100 * xgb_scores[0][0]:.2f}%')

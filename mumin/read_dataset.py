@@ -28,6 +28,17 @@ def read_dataset(token, en_only=False):
         # return tweet_dataset_df
     return tweet_claim_df
 
+def parse_tsv_line(raw_line):
+    str_emb = raw_line[1:-4]
+    emb = np.fromstring(str_emb, sep=",")
+    return emb
+
+
+def read_vctk_tsv():
+    with open("./vctk_spoken_emb.tsv", "r") as f:
+        vctk_embs = [parse_tsv_line(line) for line in f]
+    return vctk_embs
+
 
 if __name__ == '__main__':
     tweet_dataset_df = read_dataset(bearer_token, en_only=True)

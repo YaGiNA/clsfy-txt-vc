@@ -131,3 +131,7 @@ dmypy.json
 # dataset
 mumin-large.zip
 bearer_token.txt
+*.tsv
+*.txt
+.bash_history
+.ipython
